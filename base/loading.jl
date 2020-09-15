@@ -1316,6 +1316,8 @@ function parse_cache_header(f::IO)
         end
         totbytes -= 4 + 4 + n2 + 8
     end
+    prefs_hash = read(f, UInt64)
+    totbytes -= 8
     @assert totbytes == 12 "header of cache file appears to be corrupt"
     srctextpos = read(f, Int64)
     # read the list of modules that are required to be present during loading
@@ -1328,7 +1330,7 @@ function parse_cache_header(f::IO)
         build_id = read(f, UInt64) # build id
         push!(required_modules, PkgId(uuid, sym) => build_id)
     end
-    return modules, (includes, requires), required_modules, srctextpos
+    return modules, (includes, requires), required_modules, srctextpos, prefs_hash
 end
 
 function parse_cache_header(cachefile::String; srcfiles_only::Bool=false)
@@ -1337,21 +1339,21 @@ function parse_cache_header(cachefile::String; srcfiles_only::Bool=false)
         !isvalid_cache_header(io) && throw(ArgumentError("Invalid header in cache file $cachefile."))
         ret = parse_cache_header(io)
         srcfiles_only || return ret
-        modules, (includes, requires), required_modules, srctextpos = ret
+        modules, (includes, requires), required_modules, srctextpos, prefs_hash = ret
         srcfiles = srctext_files(io, srctextpos)
         delidx = Int[]
         for (i, chi) in enumerate(includes)
             chi.filename ∈ srcfiles || push!(delidx, i)
         end
         deleteat!(includes, delidx)
-        return modules, (includes, requires), required_modules, srctextpos
+        return modules, (includes, requires), required_modules, srctextpos, prefs_hash
     finally
         close(io)
     end
 end
 
 function cache_dependencies(f::IO)
-    defs, (includes, requires), modules = parse_cache_header(f)
+    defs, (includes, requires), modules, srctextpos, prefs_hash = parse_cache_header(f)
     return modules, map(chi -> (chi.filename, chi.mtime), includes)  # return just filename and mtime
 end
 
@@ -1366,7 +1368,7 @@ function cache_dependencies(cachefile::String)
 end
 
 function read_dependency_src(io::IO, filename::AbstractString)
-    modules, (includes, requires), required_modules, srctextpos = parse_cache_header(io)
+    modules, (includes, requires), required_modules, srctextpos, prefs_hash = parse_cache_header(io)
     srctextpos == 0 && error("no source-text stored in cache file")
     seek(io, srctextpos)
     return _read_dependency_src(io, filename)
@@ -1411,6 +1413,20 @@ function srctext_files(f::IO, srctextpos::Int64)
     return files
 end
 
+function get_preferences_hash(uuid::UUID, cache::TOMLCache = TOMLCache())
+    # check that project preferences match by first loading the Project.toml
+    active_project_file = Base.active_project()
+    if isfile(active_project_file)
+        preferences = get(parsed_toml(cache, active_project_file), "preferences", Dict{String,Any}())
+        if haskey(preferences, string(uuid))
+            return UInt64(hash(preferences[string(uuid)]))
+        end
+    end
+    return UInt64(hash(Dict{String,Any}()))
+end
+get_preferences_hash(::Nothing, cache::TOMLCache = TOMLCache()) = UInt64(hash(Dict{String,Any}()))
+get_preferences_hash(m::Module, cache::TOMLCache = TOMLCache()) = get_preferences_hash(PkgId(m).uuid, cache)
+
 # returns true if it "cachefile.ji" is stale relative to "modpath.jl"
 # otherwise returns the list of dependencies to also check
 stale_cachefile(modpath::String, cachefile::String) = stale_cachefile(modpath, cachefile, TOMLCache())
@@ -1421,7 +1437,7 @@ function stale_cachefile(modpath::String, cachefile::String, cache::TOMLCache)
             @debug "Rejecting cache file $cachefile due to it containing an invalid cache header"
             return true # invalid cache file
         end
-        (modules, (includes, requires), required_modules) = parse_cache_header(io)
+        modules, (includes, requires), required_modules, srctextpos, prefs_hash = parse_cache_header(io)
         id = isempty(modules) ? nothing : first(modules).first
         modules = Dict{PkgId, UInt64}(modules)
 
@@ -1496,6 +1512,12 @@ function stale_cachefile(modpath::String, cachefile::String, cache::TOMLCache)
         end
 
         if isa(id, PkgId)
+            curr_prefs_hash = get_preferences_hash(id.uuid, cache)
+            if prefs_hash != curr_prefs_hash
+                @debug "Rejecting cache file $cachefile because preferences hash does not match 0x$(string(prefs_hash, base=16)) != 0x$(string(curr_prefs_hash, base=16))"
+                return true
+            end
+
             pkgorigins[id] = PkgOrigin(cachefile)
         end
 
